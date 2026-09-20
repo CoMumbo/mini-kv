@@ -7,6 +7,8 @@ from app.store import KVStore
 from app.persistence import AOF
 from app.ttl import TTLSweeper
 from app.config import Config
+from app.db import init_db, record_command
+from app.admin import create_admin_app
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mini-kv")
@@ -74,7 +76,7 @@ def replay_aof() -> int:
     return len(lines)
 
 
-# --- AOF compaction thread --------------------------------------------------
+# --- Background threads -----------------------------------------------------
 
 class AOFCompactor:
     """Periodically rewrite the AOF to its minimal form."""
@@ -116,6 +118,27 @@ class AOFCompactor:
 COMPACTOR = AOFCompactor(AOF_LOG, STORE, interval=Config.COMPACT_INTERVAL)
 
 
+class AdminServer:
+    """Run the Flask admin app in a background thread."""
+
+    def __init__(self, app, host: str, port: int):
+        self.app = app
+        self.host = host
+        self.port = port
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="admin-http", daemon=True)
+        self._thread.start()
+        log.info("admin HTTP server started on %s:%d", self.host, self.port)
+
+    def _run(self) -> None:
+        # use_reloader=False: we don't want Flask spawning a second process
+        self.app.run(host=self.host, port=self.port, debug=False, use_reloader=False, threaded=True)
+
+
 # --- TCP server -------------------------------------------------------------
 
 class KVHandler(socketserver.StreamRequestHandler):
@@ -127,6 +150,8 @@ class KVHandler(socketserver.StreamRequestHandler):
                 line = raw.decode("utf-8", errors="replace")
                 try:
                     response = dispatch(line, log_write=True)
+                    if line.strip().upper() != "QUIT":
+                        record_command(1)
                 except ProtocolError as e:
                     response = f"ERR {e}\n"
                 except ValueError as e:
@@ -146,11 +171,17 @@ class KVServer(socketserver.ThreadingTCPServer):
 
 
 def main():
+    init_db()
+
     replayed = replay_aof()
     log.info("replayed %d commands from AOF", replayed)
 
     SWEEPER.start()
     COMPACTOR.start()
+
+    admin_app = create_admin_app(STORE, AOF_LOG)
+    admin = AdminServer(admin_app, host="127.0.0.1", port=Config.ADMIN_PORT)
+    admin.start()
 
     with KVServer((Config.HOST, Config.PORT), KVHandler) as server:
         log.info("mini-kv listening on %s:%s", Config.HOST, Config.PORT)
