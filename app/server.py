@@ -1,8 +1,11 @@
 import socketserver
+import threading
 import logging
+import time
 from app.protocol import parse, encode, ProtocolError
 from app.store import KVStore
 from app.persistence import AOF
+from app.ttl import TTLSweeper
 from app.config import Config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -12,6 +15,7 @@ log = logging.getLogger("mini-kv")
 
 STORE = KVStore()
 AOF_LOG = AOF(Config.AOF_PATH)
+SWEEPER = TTLSweeper(STORE, interval=Config.TTL_SWEEP_INTERVAL)
 
 
 # --- Command dispatch -------------------------------------------------------
@@ -23,7 +27,6 @@ def dispatch(line: str, *, log_write: bool) -> str:
     """Parse and execute one command. Optionally append writes to AOF."""
     cmd, args = parse(line)
 
-    # Log writes to disk BEFORE applying them to memory.
     if log_write and cmd in WRITE_COMMANDS:
         AOF_LOG.append(line)
 
@@ -62,14 +65,55 @@ def dispatch(line: str, *, log_write: bool) -> str:
 
 
 def replay_aof() -> int:
-    """Replay the AOF into the store. Returns number of commands replayed."""
     lines = AOF_LOG.replay()
     for line in lines:
         try:
-            dispatch(line, log_write=False)  # don't re-log during replay
+            dispatch(line, log_write=False)
         except ProtocolError as e:
             log.warning("skipping bad AOF line %r: %s", line, e)
     return len(lines)
+
+
+# --- AOF compaction thread --------------------------------------------------
+
+class AOFCompactor:
+    """Periodically rewrite the AOF to its minimal form."""
+
+    def __init__(self, aof: AOF, store: KVStore, interval: float):
+        self.aof = aof
+        self.store = store
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="aof-compactor", daemon=True)
+        self._thread.start()
+        log.info("AOF compactor started (interval=%.0fs)", self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            log.info("AOF compactor stopped")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(self.interval)
+            if self._stop.is_set():
+                return
+            try:
+                before = len(self.aof.replay())
+                n = self.aof.compact(self.store.snapshot(), self.store.expires_snapshot())
+                if before != n:
+                    log.info("compacted AOF: %d -> %d lines", before, n)
+            except Exception:
+                log.exception("AOF compactor error")
+
+
+COMPACTOR = AOFCompactor(AOF_LOG, STORE, interval=Config.COMPACT_INTERVAL)
 
 
 # --- TCP server -------------------------------------------------------------
@@ -105,6 +149,9 @@ def main():
     replayed = replay_aof()
     log.info("replayed %d commands from AOF", replayed)
 
+    SWEEPER.start()
+    COMPACTOR.start()
+
     with KVServer((Config.HOST, Config.PORT), KVHandler) as server:
         log.info("mini-kv listening on %s:%s", Config.HOST, Config.PORT)
         try:
@@ -112,6 +159,8 @@ def main():
         except KeyboardInterrupt:
             log.info("shutting down")
         finally:
+            SWEEPER.stop()
+            COMPACTOR.stop()
             AOF_LOG.close()
 
 

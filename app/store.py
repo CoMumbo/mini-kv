@@ -57,8 +57,30 @@ class KVStore:
             self._expires.pop(key, None)
             self._data.pop(key, None)
 
+    def sweep_expired(self) -> int:
+        """Remove all expired keys. Returns the number removed.
+
+        Called periodically by the TTL sweeper thread.
+        """
+        removed = 0
+        with self._lock:
+            now = time.time()
+            expired = [k for k, exp in self._expires.items() if exp <= now]
+            for k in expired:
+                self._expires.pop(k, None)
+                if self._data.pop(k, None) is not None:
+                    removed += 1
+        return removed
+
     def snapshot(self) -> dict[str, str]:
         with self._lock:
             for k in list(self._expires):
                 self._maybe_expire(k)
             return dict(self._data)
+
+    def expires_snapshot(self) -> dict[str, float]:
+        """Return a copy of the live expiration map (key -> unix timestamp)."""
+        with self._lock:
+            now = time.time()
+            return {k: exp for k, exp in self._expires.items()
+                    if k in self._data and exp > now}

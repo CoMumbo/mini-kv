@@ -39,3 +39,25 @@ def test_keys_and_flush():
     assert set(s.keys()) == {"a", "b"}
     s.flush()
     assert s.keys() == []
+
+
+def test_sweep_expired_removes_multiple():
+    s = KVStore()
+    s.set("a", "1")
+    s.set("b", "2")
+    s.set("c", "3")
+    s.expire("a", 1)
+    s.expire("b", 1)
+    time.sleep(1.1)
+    removed = s.sweep_expired()
+    assert removed == 2
+    assert s.keys() == ["c"]
+
+
+def test_sweep_expired_no_expired_keys():
+    s = KVStore()
+    s.set("a", "1")
+    s.set("b", "2")
+    removed = s.sweep_expired()
+    assert removed == 0
+    assert set(s.keys()) == {"a", "b"}

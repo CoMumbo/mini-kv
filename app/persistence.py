@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import logging
 
 log = logging.getLogger("mini-kv.aof")
@@ -43,6 +44,26 @@ class AOF:
             os.replace(tmp, self.path)
             self._file = open(self.path, "a", encoding="utf-8", buffering=1)
             log.info("AOF rewritten with %d lines", len(lines))
+
+    def compact(self, live_state: dict[str, str], expires: dict[str, float]) -> int:
+        """Rewrite the AOF to its minimal form.
+
+        `live_state` is the current key/value dict; `expires` maps keys to
+        their absolute unix expiration timestamps.
+
+        Returns the number of lines written.
+        """
+        lines: list[str] = []
+        for key, value in live_state.items():
+            lines.append(f"SET {key} {value}")
+        now = time.time()
+        for key, expiry in expires.items():
+            if key in live_state:
+                remaining = int(expiry - now)
+                if remaining > 0:
+                    lines.append(f"EXPIRE {key} {remaining}")
+        self.rewrite(lines)
+        return len(lines)
 
     def close(self) -> None:
         with self._lock:
